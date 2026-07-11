@@ -1,0 +1,822 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TFS Stock-Scan System</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect } = React;
+
+// ---------- Supabase ----------
+const SUPABASE_URL = "https://ykoqixoykwebyzpzgjyp.supabase.co";
+const SUPABASE_ANON_KEY =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inlrb3FpeG95a3dlYnl6cHpnanlwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM2ODU4OTAsImV4cCI6MjA5OTI2MTg5MH0.QrwmVCRdDAD5Ib7AYGucb96-rLCzC8vB5TWL9YEB1uk";
+
+async function sb(path, options = {}) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: options.prefer || "return=representation",
+      ...(options.headers || {}),
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Supabase ${res.status}: ${text}`);
+  }
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+// ---------- TFS brand tokens ----------
+const RED = "#C8102E";
+const AMBER = "#E8A013";
+const INK = "#17181A";
+const GREY = "#6B6F76";
+const LINE = "#E6E7E9";
+const BG = "#F4F4F5";
+const GREEN = "#1E8E3E";
+
+// Employees and stock are loaded live from Supabase — see loadAll() in App.
+// (Static seed data now lives in the database, not here, so this file and
+// the database can never drift out of sync.)
+
+const fmtTime = (d) =>
+  d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+
+// Days of stock remaining at current average usage
+const daysLeft = (item) => (item.usage > 0 ? item.qty / (item.usage / 7) : Infinity);
+
+// Status from days remaining: red <5 days, amber <14, green otherwise
+const statusOf = (item) => {
+  if (item.qty === 0) return "out";
+  const d = daysLeft(item);
+  if (d < 5) return "red";
+  if (d < 14) return "amber";
+  return "green";
+};
+
+const statusColor = { out: RED, red: RED, amber: AMBER, green: GREEN };
+
+// ---------- Small shared bits ----------
+const TfsLogo = ({ size = 34 }) => (
+  <div style={{ display: "flex" }}>
+    {["T", "F", "S"].map((l, i) => (
+      <div
+        key={l}
+        style={{
+          width: size, height: size, borderRadius: "50%", background: RED,
+          color: "#fff", display: "flex", alignItems: "center", justifyContent: "center",
+          fontFamily: "Georgia, 'Times New Roman', serif", fontWeight: 700,
+          fontSize: size * 0.52, marginLeft: i === 0 ? 0 : -size * 0.18,
+          border: "2px solid #fff", boxShadow: "0 1px 2px rgba(0,0,0,.15)",
+        }}
+      >
+        {l}
+      </div>
+    ))}
+  </div>
+);
+
+// Pseudo-QR (visual placeholder — real build uses a proper QR lib)
+const FakeQr = ({ seed, size = 168 }) => {
+  const n = 21, cell = size / n;
+  let s = seed;
+  const rnd = () => { s = (s * 1103515245 + 12345) % 2147483648; return s / 2147483648; };
+  const cells = [];
+  for (let y = 0; y < n; y++)
+    for (let x = 0; x < n; x++) {
+      const finder =
+        (x < 7 && y < 7) || (x >= n - 7 && y < 7) || (x < 7 && y >= n - 7);
+      let fill = false;
+      if (finder) {
+        const lx = x >= n - 7 ? x - (n - 7) : x, ly = y >= n - 7 ? y - (n - 7) : y;
+        fill = lx === 0 || lx === 6 || ly === 0 || ly === 6 || (lx > 1 && lx < 5 && ly > 1 && ly < 5);
+      } else fill = rnd() > 0.55;
+      if (fill) cells.push(<rect key={`${x}-${y}`} x={x * cell} y={y * cell} width={cell} height={cell} fill={INK} />);
+    }
+  return (
+    <svg width={size} height={size} style={{ background: "#fff", borderRadius: 8 }}>
+      {cells}
+    </svg>
+  );
+};
+
+const Btn = ({ children, onClick, variant = "primary", disabled, style }) => (
+  <button
+    onClick={onClick}
+    disabled={disabled}
+    style={{
+      fontFamily: "inherit", fontWeight: 600, fontSize: 15,
+      padding: "13px 22px", borderRadius: 10, cursor: disabled ? "default" : "pointer",
+      border: variant === "ghost" ? `1.5px solid ${LINE}` : "none",
+      background: disabled ? "#D7D8DA" : variant === "primary" ? RED : variant === "dark" ? INK : "#fff",
+      color: variant === "ghost" ? INK : "#fff",
+      transition: "transform .06s ease, background .15s ease",
+      ...style,
+    }}
+    onMouseDown={(e) => !disabled && (e.currentTarget.style.transform = "scale(.97)")}
+    onMouseUp={(e) => (e.currentTarget.style.transform = "scale(1)")}
+    onMouseLeave={(e) => (e.currentTarget.style.transform = "scale(1)")}
+  >
+    {children}
+  </button>
+);
+
+// ================================================================
+function App() {
+  const [device, setDevice] = useState("tablet");
+
+  // live data from Supabase
+  const [employees, setEmployees] = useState([]);
+  const [stock, setStock] = useState([]);
+  const [rawLog, setRawLog] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  const loadAll = async () => {
+    try {
+      const [emps, items, logs] = await Promise.all([
+        sb("employees?select=*&order=id.asc"),
+        sb("stock_items?select=*&order=id.asc"),
+        sb("log_entries?select=*&order=created_at.desc&limit=50"),
+      ]);
+      setEmployees(emps.map((e) => ({ id: e.id, name: e.name, role: e.role, pin: e.pin })));
+      setStock(
+        items.map((s) => ({
+          id: s.id, name: s.name, cat: s.category, qty: s.qty, unit: s.unit, usage: Number(s.usage_per_week),
+        }))
+      );
+      setRawLog(logs);
+      setError(null);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { loadAll(); }, []);
+
+  // build display-ready log rows (join employee/item names client-side)
+  const empMap = Object.fromEntries(employees.map((e) => [e.id, e.name]));
+  const itemMap = Object.fromEntries(stock.map((s) => [s.id, s.name]));
+  const log = rawLog.map((r) => {
+    const isRestock = r.job_reference === "Goods in — restock";
+    return {
+      id: r.id,
+      time: fmtTime(new Date(r.created_at)),
+      who: r.employee_id ? (empMap[r.employee_id] || "Unknown") : "Stores Admin",
+      item: itemMap[r.item_id] || "Unknown item",
+      qty: isRestock ? `+${r.quantity}` : String(r.quantity),
+      job: r.job_reference || "—",
+    };
+  });
+
+  // session / handoff
+  const [tabletStage, setTabletStage] = useState("splash"); // splash | names | pin | qr | stockroom | done
+  const [phoneStage, setPhoneStage] = useState("idle"); // idle | choice | stockroom | done
+  const [activeEmp, setActiveEmp] = useState(null);
+  const [pinInput, setPinInput] = useState("");
+  const [pinError, setPinError] = useState(false);
+  const [qrSeed, setQrSeed] = useState(1);
+  const [qrExpiry, setQrExpiry] = useState(30);
+
+  // QR countdown
+  useEffect(() => {
+    if (tabletStage !== "qr") return;
+    setQrExpiry(30);
+    const t = setInterval(() => {
+      setQrExpiry((s) => {
+        if (s <= 1) {
+          clearInterval(t);
+          setTabletStage("splash");
+          setActiveEmp(null);
+          return 0;
+        }
+        return s - 1;
+      });
+    }, 1000);
+    return () => clearInterval(t);
+  }, [tabletStage]);
+
+  const resetAll = () => {
+    setTabletStage("splash");
+    setPhoneStage("idle");
+    setActiveEmp(null);
+    setPinInput("");
+  };
+
+  const submitLog = async (basket, jobRef) => {
+    setSaving(true);
+    try {
+      for (const b of basket) {
+        const item = stock.find((s) => s.id === b.id);
+        const newQty = Math.max(0, item.qty - b.take);
+        await sb(`stock_items?id=eq.${item.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ qty: newQty }),
+        });
+        await sb("log_entries", {
+          method: "POST",
+          body: JSON.stringify({
+            employee_id: activeEmp.id,
+            item_id: item.id,
+            quantity: b.take,
+            job_reference: jobRef || null,
+          }),
+        });
+      }
+      await loadAll();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const restock = async (id, amount) => {
+    const item = stock.find((s) => s.id === id);
+    if (!item || amount <= 0) return;
+    setSaving(true);
+    try {
+      await sb(`stock_items?id=eq.${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ qty: item.qty + amount }),
+      });
+      await sb("log_entries", {
+        method: "POST",
+        body: JSON.stringify({
+          employee_id: null,
+          item_id: id,
+          quantity: amount,
+          job_reference: "Goods in — restock",
+        }),
+      });
+      await loadAll();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // ---------------- Tablet ----------------
+  const Tablet = () => {
+    const pressKey = (k) => {
+      setPinError(false);
+      if (k === "del") return setPinInput((p) => p.slice(0, -1));
+      if (pinInput.length >= 4) return;
+      const next = pinInput + k;
+      setPinInput(next);
+      if (next.length === 4) {
+        if (next === activeEmp.pin) {
+          setPinInput("");
+          setQrSeed(Math.floor(Math.random() * 1e6) + 7);
+          setTabletStage("qr");
+        } else {
+          setPinError(true);
+          setTimeout(() => setPinInput(""), 350);
+        }
+      }
+    };
+
+    return (
+      <DeviceFrame kind="tablet">
+        <header style={{ background: RED, padding: "14px 20px", display: "flex", alignItems: "center", gap: 14 }}>
+          <TfsLogo size={30} />
+          <div>
+            <div style={{ color: "#fff", fontWeight: 700, fontSize: 15, letterSpacing: 1 }}>STOCK ROOM</div>
+            <div style={{ color: "rgba(255,255,255,.75)", fontSize: 11 }}>Tees Fire Systems Ltd</div>
+          </div>
+          {tabletStage !== "splash" && (
+            <button onClick={resetAll} style={{ marginLeft: "auto", background: "rgba(255,255,255,.15)", border: "none", color: "#fff", borderRadius: 8, padding: "7px 13px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+              Cancel
+            </button>
+          )}
+        </header>
+
+        <div style={{ flex: 1, overflowY: "auto", padding: 24 }}>
+          {tabletStage === "splash" && (
+            <div style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", gap: 18 }}>
+              <TfsLogo size={54} />
+              <div style={{ fontSize: 26, fontWeight: 800, letterSpacing: .5, color: INK }}>FIND YOUR LOGIN</div>
+              <div style={{ color: GREY, fontSize: 15, maxWidth: 320 }}>
+                Sign in, scan, and log what you're taking. Takes under 15 seconds.
+              </div>
+              <Btn onClick={() => setTabletStage("names")} style={{ padding: "16px 40px", fontSize: 17 }}>
+                Start
+              </Btn>
+            </div>
+          )}
+
+          {tabletStage === "names" && (
+            <>
+              <div style={{ fontWeight: 800, fontSize: 20, marginBottom: 4 }}>Who's taking stock?</div>
+              <div style={{ color: GREY, fontSize: 14, marginBottom: 18 }}>Tap your name</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                {employees.map((e) => (
+                  <button
+                    key={e.id}
+                    onClick={() => { setActiveEmp(e); setPinInput(""); setTabletStage("pin"); }}
+                    style={{ textAlign: "left", background: "#fff", border: `1.5px solid ${LINE}`, borderRadius: 12, padding: "16px 18px", cursor: "pointer", fontFamily: "inherit" }}
+                  >
+                    <div style={{ fontWeight: 700, fontSize: 16, color: INK }}>{e.name}</div>
+                    <div style={{ color: GREY, fontSize: 12.5, marginTop: 3 }}>{e.role}</div>
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+
+          {tabletStage === "pin" && activeEmp && (
+            <div style={{ maxWidth: 300, margin: "0 auto", textAlign: "center" }}>
+              <div style={{ fontWeight: 800, fontSize: 19 }}>{activeEmp.name}</div>
+              <div style={{ color: GREY, fontSize: 14, marginBottom: 18 }}>Enter your 4-digit PIN</div>
+              <div style={{ display: "flex", gap: 12, justifyContent: "center", marginBottom: 8 }}>
+                {[0, 1, 2, 3].map((i) => (
+                  <div key={i} style={{ width: 16, height: 16, borderRadius: "50%", border: `2px solid ${pinError ? RED : "#B9BBBE"}`, background: pinInput.length > i ? (pinError ? RED : INK) : "transparent", transition: "background .1s" }} />
+                ))}
+              </div>
+              <div style={{ height: 20, color: RED, fontSize: 13, fontWeight: 600 }}>
+                {pinError ? "Wrong PIN — try again" : ""}
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10 }}>
+                {["1","2","3","4","5","6","7","8","9","","0","del"].map((k, i) =>
+                  k === "" ? <div key={i} /> : (
+                    <button key={i} onClick={() => pressKey(k)}
+                      style={{ padding: "16px 0", fontSize: 20, fontWeight: 600, borderRadius: 10, border: `1.5px solid ${LINE}`, background: "#fff", cursor: "pointer", fontFamily: "inherit", color: INK }}>
+                      {k === "del" ? "⌫" : k}
+                    </button>
+                  )
+                )}
+              </div>
+              <div style={{ marginTop: 14, color: GREY, fontSize: 12 }}>
+                Demo PINs: {employees.map((e) => `${e.name.split(" ")[0]} ${e.pin}`).join(" · ")}
+              </div>
+            </div>
+          )}
+
+          {tabletStage === "qr" && activeEmp && (
+            <div style={{ textAlign: "center", display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
+              <div style={{ fontWeight: 800, fontSize: 19 }}>Hi {activeEmp.name.split(" ")[0]} 👋</div>
+              <div style={{ color: GREY, fontSize: 14, maxWidth: 300 }}>
+                Scan this code with your phone camera — or continue right here on the tablet.
+              </div>
+              <div style={{ padding: 14, background: "#fff", border: `1.5px solid ${LINE}`, borderRadius: 14 }}>
+                <FakeQr seed={qrSeed} />
+              </div>
+              <div style={{ fontSize: 13, color: qrExpiry <= 10 ? RED : GREY, fontWeight: 600 }}>
+                Code expires in {qrExpiry}s · single use
+              </div>
+              <Btn variant="ghost" onClick={() => { setTabletStage("stockroom"); setPhoneStage("idle"); }}>
+                Continue on this tablet instead
+              </Btn>
+            </div>
+          )}
+
+          {tabletStage === "stockroom" && activeEmp && (
+            <StockRoom
+              compact={false}
+              emp={activeEmp}
+              stock={stock}
+              onSubmit={(basket, job) => { submitLog(basket, job); setTabletStage("done"); }}
+              onCancel={resetAll}
+            />
+          )}
+
+          {tabletStage === "done" && (
+            <DoneScreen onDone={resetAll} />
+          )}
+        </div>
+      </DeviceFrame>
+    );
+  };
+
+  // ---------------- Phone ----------------
+  const Phone = () => (
+    <DeviceFrame kind="phone">
+      <header style={{ background: INK, padding: "12px 16px", display: "flex", alignItems: "center", gap: 10 }}>
+        <TfsLogo size={24} />
+        <div style={{ color: "#fff", fontWeight: 700, fontSize: 13, letterSpacing: .8 }}>TFS VIRTUAL STOCK ROOM</div>
+      </header>
+      <div style={{ flex: 1, overflowY: "auto", padding: 18 }}>
+        {phoneStage === "idle" && (
+          <div style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16, textAlign: "center" }}>
+            <div style={{ fontSize: 40 }}>📷</div>
+            <div style={{ fontWeight: 700, fontSize: 17 }}>Scan the tablet's QR code</div>
+            <div style={{ color: GREY, fontSize: 13.5, maxWidth: 230 }}>
+              Sign in on the stock room tablet first, then point your camera at the code it shows.
+            </div>
+            <Btn
+              disabled={tabletStage !== "qr"}
+              onClick={() => setPhoneStage("choice")}
+            >
+              {tabletStage === "qr" ? "Simulate scanning the QR" : "Waiting for tablet sign-in…"}
+            </Btn>
+          </div>
+        )}
+
+        {phoneStage === "choice" && activeEmp && (
+          <div style={{ height: "100%", display: "flex", flexDirection: "column", justifyContent: "center", gap: 12, textAlign: "center" }}>
+            <div style={{ fontWeight: 800, fontSize: 18 }}>Signed in as {activeEmp.name}</div>
+            <div style={{ color: GREY, fontSize: 13.5, marginBottom: 8 }}>Where do you want to continue?</div>
+            <Btn onClick={() => { setPhoneStage("stockroom"); setTabletStage("splash"); }}>
+              Continue on this phone
+            </Btn>
+            <Btn variant="ghost" onClick={() => { setPhoneStage("idle"); setTabletStage("stockroom"); }}>
+              Use the tablet instead
+            </Btn>
+          </div>
+        )}
+
+        {phoneStage === "stockroom" && activeEmp && (
+          <StockRoom
+            compact
+            emp={activeEmp}
+            stock={stock}
+            onSubmit={(basket, job) => { submitLog(basket, job); setPhoneStage("done"); }}
+            onCancel={resetAll}
+          />
+        )}
+
+        {phoneStage === "done" && <DoneScreen onDone={resetAll} />}
+      </div>
+    </DeviceFrame>
+  );
+
+  // ---------------- Layout ----------------
+  if (loading) {
+    return (
+      <div style={{ minHeight: "100vh", background: BG, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Poppins','Segoe UI',system-ui,sans-serif" }}>
+        <div style={{ textAlign: "center", color: GREY }}>
+          <TfsLogo size={40} />
+          <div style={{ marginTop: 12, fontSize: 14 }}>Connecting to the database…</div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: BG, fontFamily: "'Poppins','Segoe UI',system-ui,sans-serif", color: INK, padding: "22px 16px 60px" }}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap');`}</style>
+
+      <div style={{ maxWidth: 900, margin: "0 auto" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 6 }}>
+          <TfsLogo size={36} />
+          <div>
+            <div style={{ fontWeight: 800, fontSize: 19, letterSpacing: .3 }}>TFS Stock-Scan System</div>
+            <div style={{ color: GREY, fontSize: 13 }}>
+              {error ? (
+                <span style={{ color: RED }}>Sync error: {error}</span>
+              ) : saving ? (
+                "Saving…"
+              ) : (
+                "Live · connected to Supabase"
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, margin: "18px 0 22px" }}>
+          {[
+            ["tablet", "Stock Room Tablet"],
+            ["phone", "Worker's Phone"],
+            ["dashboard", "Admin Dashboard"],
+          ].map(([k, label]) => (
+            <button key={k} onClick={() => setDevice(k)}
+              style={{ fontFamily: "inherit", fontWeight: 600, fontSize: 13.5, padding: "10px 18px", borderRadius: 999, cursor: "pointer", border: `1.5px solid ${device === k ? RED : LINE}`, background: device === k ? RED : "#fff", color: device === k ? "#fff" : INK }}>
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", justifyContent: "center" }}>
+          {device === "tablet" && <Tablet />}
+          {device === "phone" && <Phone />}
+          {device === "dashboard" && (
+            <DashboardView stock={stock} log={log} onRestock={restock} onRefresh={loadAll} />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Dashboard (module-level so inputs keep focus) ----------------
+function DashboardView({ stock, log, onRestock, onRefresh }) {
+  const [search, setSearch] = useState("");
+  const [sort, setSort] = useState("default"); // default | alpha | urgent
+  const [restockId, setRestockId] = useState(null);
+  const [restockQty, setRestockQty] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+
+  const doRefresh = async () => {
+    setRefreshing(true);
+    await onRefresh();
+    setRefreshing(false);
+  };
+
+  const urgentCount = stock.filter((s) => statusOf(s) === "red" || statusOf(s) === "out").length;
+
+  let shown = stock.filter(
+    (s) =>
+      s.name.toLowerCase().includes(search.toLowerCase()) ||
+      s.cat.toLowerCase().includes(search.toLowerCase())
+  );
+  if (sort === "alpha") shown = [...shown].sort((a, b) => a.name.localeCompare(b.name));
+  if (sort === "urgent") shown = [...shown].sort((a, b) => daysLeft(a) - daysLeft(b));
+
+  const confirmRestock = (id) => {
+    const n = parseInt(restockQty, 10);
+    if (!isNaN(n) && n > 0) onRestock(id, n);
+    setRestockId(null);
+    setRestockQty("");
+  };
+
+  return (
+    <div style={{ background: "#fff", borderRadius: 16, border: `1px solid ${LINE}`, overflow: "hidden", width: "100%", maxWidth: 780 }}>
+      <header style={{ background: INK, padding: "16px 22px", display: "flex", alignItems: "center", gap: 12 }}>
+        <TfsLogo size={28} />
+        <div>
+          <div style={{ color: "#fff", fontWeight: 700, fontSize: 15, letterSpacing: .8 }}>STOCK DASHBOARD</div>
+          <div style={{ color: "rgba(255,255,255,.6)", fontSize: 11.5 }}>Live — reorder urgency based on average usage rates</div>
+        </div>
+        <button onClick={doRefresh} style={{ marginLeft: "auto", fontFamily: "inherit", fontWeight: 600, fontSize: 12, padding: "8px 14px", borderRadius: 8, cursor: "pointer", border: "none", background: "rgba(255,255,255,.15)", color: "#fff" }}>
+          {refreshing ? "Refreshing…" : "↻ Refresh from database"}
+        </button>
+      </header>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 1, background: LINE }}>
+        {[
+          ["Stock lines", stock.length, false],
+          ["Entries today", log.length, false],
+          ["Urgent reorders", urgentCount, urgentCount > 0],
+        ].map(([label, val, alert]) => (
+          <div key={label} style={{ background: "#fff", padding: "16px 20px" }}>
+            <div style={{ fontSize: 26, fontWeight: 800, color: alert ? RED : INK }}>{val}</div>
+            <div style={{ fontSize: 12.5, color: GREY }}>{label}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ padding: 22, display: "grid", gap: 26 }}>
+        <section>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
+            <div style={{ fontWeight: 800, fontSize: 15, letterSpacing: .4, marginRight: "auto" }}>STOCK LEVELS</div>
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search items…"
+              style={{ fontFamily: "inherit", fontSize: 13, padding: "8px 12px", borderRadius: 8, border: `1.5px solid ${LINE}`, outline: "none", width: 170 }}
+            />
+            <div style={{ display: "flex", gap: 6 }}>
+              {[
+                ["default", "Default"],
+                ["alpha", "A–Z"],
+                ["urgent", "Most urgent"],
+              ].map(([k, label]) => (
+                <button key={k} onClick={() => setSort(k)}
+                  style={{ fontFamily: "inherit", fontWeight: 600, fontSize: 12, padding: "8px 12px", borderRadius: 8, cursor: "pointer", border: `1.5px solid ${sort === k ? RED : LINE}`, background: sort === k ? RED : "#fff", color: sort === k ? "#fff" : INK }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gap: 8 }}>
+            {shown.length === 0 && (
+              <div style={{ color: GREY, fontSize: 13, padding: "14px 0" }}>
+                No items match "{search}".
+              </div>
+            )}
+            {shown.map((s) => {
+              const st = statusOf(s);
+              const col = statusColor[st];
+              const d = daysLeft(s);
+              // Bar shows runway toward a 4-week (28 day) comfort level
+              const pct = s.qty === 0 ? 0 : Math.min(100, (d / 28) * 100);
+              const reorderQty = Math.max(0, Math.ceil(s.usage * 4 - s.qty));
+              const isUrgent = st === "red" || st === "out";
+              return (
+                <div key={s.id} style={{ borderBottom: `1px solid ${LINE}`, paddingBottom: 8 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 120px 140px 92px", alignItems: "center", gap: 12, fontSize: 13.5 }}>
+                    <div style={{ fontWeight: 600, color: INK }}>
+                      {s.name}
+                      <span style={{ color: GREY, fontWeight: 400, marginLeft: 8, fontSize: 11.5 }}>{s.cat}</span>
+                    </div>
+                    <div>
+                      <div style={{ fontWeight: 700, color: isUrgent ? RED : INK }}>
+                        {s.qty} {s.unit}
+                        {isUrgent && <span style={{ marginLeft: 6, fontSize: 10, background: RED, color: "#fff", borderRadius: 4, padding: "2px 5px", verticalAlign: "middle" }}>{st === "out" ? "OUT" : "URGENT"}</span>}
+                      </div>
+                      <div style={{ fontSize: 11, color: col, fontWeight: 600 }}>
+                        {s.qty === 0 ? "Out of stock" : `~${Math.round(d)} days left`}
+                      </div>
+                    </div>
+                    <div style={{ height: 8, background: BG, borderRadius: 4, overflow: "hidden" }}>
+                      <div style={{ width: `${pct}%`, height: "100%", background: col, transition: "width .4s" }} />
+                    </div>
+                    {restockId === s.id ? null : (
+                      <button
+                        onClick={() => { setRestockId(s.id); setRestockQty(""); }}
+                        style={{ fontFamily: "inherit", fontWeight: 600, fontSize: 12, padding: "7px 10px", borderRadius: 8, cursor: "pointer", border: `1.5px solid ${LINE}`, background: "#fff", color: INK }}>
+                        + Restock
+                      </button>
+                    )}
+                  </div>
+                  {isUrgent && restockId !== s.id && reorderQty > 0 && (
+                    <div style={{ fontSize: 11.5, color: GREY, marginTop: 4 }}>
+                      Suggested: reorder ~{reorderQty} {s.unit} to cover 4 weeks at current usage ({s.usage}/week)
+                    </div>
+                  )}
+                  {restockId === s.id && (
+                    <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
+                      <input
+                        autoFocus
+                        value={restockQty}
+                        onChange={(e) => setRestockQty(e.target.value.replace(/\D/g, ""))}
+                        placeholder={reorderQty > 0 ? `e.g. ${reorderQty}` : "Quantity"}
+                        style={{ fontFamily: "inherit", fontSize: 13, padding: "8px 12px", borderRadius: 8, border: `1.5px solid ${LINE}`, outline: "none", width: 110 }}
+                      />
+                      <button onClick={() => confirmRestock(s.id)}
+                        style={{ fontFamily: "inherit", fontWeight: 600, fontSize: 12, padding: "8px 14px", borderRadius: 8, cursor: "pointer", border: "none", background: GREEN, color: "#fff" }}>
+                        Add stock
+                      </button>
+                      <button onClick={() => { setRestockId(null); setRestockQty(""); }}
+                        style={{ fontFamily: "inherit", fontWeight: 600, fontSize: 12, padding: "8px 12px", borderRadius: 8, cursor: "pointer", border: `1.5px solid ${LINE}`, background: "#fff", color: GREY }}>
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </section>
+
+        <section>
+          <div style={{ fontWeight: 800, fontSize: 15, marginBottom: 10, letterSpacing: .4 }}>ACTIVITY LOG</div>
+          <div style={{ border: `1px solid ${LINE}`, borderRadius: 10, overflow: "hidden" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "70px 1.2fr 1.4fr 60px 1.3fr", background: BG, padding: "9px 14px", fontSize: 11, fontWeight: 700, color: GREY, letterSpacing: .5 }}>
+              <div>TIME</div><div>WHO</div><div>ITEM</div><div>QTY</div><div>JOB REF</div>
+            </div>
+            {log.map((e) => {
+              const isRestock = String(e.qty).startsWith("+");
+              return (
+                <div key={e.id} style={{ display: "grid", gridTemplateColumns: "70px 1.2fr 1.4fr 60px 1.3fr", padding: "10px 14px", fontSize: 13, borderTop: `1px solid ${LINE}`, background: isRestock ? "#F2F9F4" : "#fff" }}>
+                  <div style={{ color: GREY }}>{e.time}</div>
+                  <div style={{ fontWeight: 600 }}>{e.who}</div>
+                  <div>{e.item}</div>
+                  <div style={{ color: isRestock ? GREEN : INK, fontWeight: isRestock ? 700 : 400 }}>{e.qty}</div>
+                  <div style={{ color: GREY }}>{e.job}</div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Stock room (shared by phone + tablet) ----------------
+function StockRoom({ emp, stock, onSubmit, onCancel, compact }) {
+  const [search, setSearch] = useState("");
+  const [basket, setBasket] = useState([]); // {id, name, take}
+  const [jobRef, setJobRef] = useState("");
+
+  const filtered = stock.filter((s) =>
+    s.name.toLowerCase().includes(search.toLowerCase()) ||
+    s.cat.toLowerCase().includes(search.toLowerCase())
+  );
+
+  const inBasket = (id) => basket.find((b) => b.id === id);
+  const add = (item) => {
+    if (item.qty === 0) return;
+    setBasket((b) =>
+      inBasket(item.id)
+        ? b.map((x) => x.id === item.id ? { ...x, take: Math.min(item.qty, x.take + 1) } : x)
+        : [...b, { id: item.id, name: item.name, take: 1 }]
+    );
+  };
+  const dec = (id) =>
+    setBasket((b) => b.map((x) => x.id === id ? { ...x, take: x.take - 1 } : x).filter((x) => x.take > 0));
+
+  const total = basket.reduce((n, b) => n + b.take, 0);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12, height: "100%" }}>
+      <div>
+        <div style={{ fontWeight: 800, fontSize: compact ? 16 : 19 }}>Log your stock</div>
+        <div style={{ color: GREY, fontSize: 12.5 }}>Signed in as {emp.name}</div>
+      </div>
+
+      <input
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
+        placeholder="Search items…"
+        style={{ fontFamily: "inherit", fontSize: 14, padding: "11px 14px", borderRadius: 10, border: `1.5px solid ${LINE}`, outline: "none", background: "#fff" }}
+      />
+
+      <div style={{ flex: 1, overflowY: "auto", display: "grid", gap: 8, alignContent: "start" }}>
+        {filtered.map((item) => {
+          const b = inBasket(item.id);
+          const out = item.qty === 0;
+          return (
+            <div key={item.id}
+              style={{ display: "flex", alignItems: "center", gap: 10, background: "#fff", border: `1.5px solid ${b ? RED : LINE}`, borderRadius: 12, padding: "11px 14px", opacity: out ? 0.5 : 1 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600, fontSize: 14 }}>{item.name}</div>
+                <div style={{ color: GREY, fontSize: 11.5 }}>{item.cat} · {item.qty} {item.unit} in stock</div>
+              </div>
+              {b ? (
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <QtyBtn onClick={() => dec(item.id)}>−</QtyBtn>
+                  <div style={{ fontWeight: 800, minWidth: 18, textAlign: "center" }}>{b.take}</div>
+                  <QtyBtn onClick={() => add(item)}>+</QtyBtn>
+                </div>
+              ) : (
+                <QtyBtn onClick={() => add(item)} wide>{out ? "Out" : "Take"}</QtyBtn>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <input
+        value={jobRef}
+        onChange={(e) => setJobRef(e.target.value)}
+        placeholder="Job reference (e.g. Boho X — Middlesbrough)"
+        style={{ fontFamily: "inherit", fontSize: 14, padding: "11px 14px", borderRadius: 10, border: `1.5px solid ${LINE}`, outline: "none", background: "#fff" }}
+      />
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <Btn variant="ghost" onClick={onCancel} style={{ flex: 1 }}>Cancel</Btn>
+        <Btn disabled={total === 0} onClick={() => onSubmit(basket, jobRef)} style={{ flex: 2 }}>
+          Confirm {total > 0 ? `${total} item${total > 1 ? "s" : ""}` : ""}
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+const QtyBtn = ({ children, onClick, wide }) => (
+  <button onClick={onClick}
+    style={{ fontFamily: "inherit", fontWeight: 700, fontSize: 15, width: wide ? "auto" : 32, height: 32, padding: wide ? "0 16px" : 0, borderRadius: 8, border: "none", background: RED, color: "#fff", cursor: "pointer" }}>
+    {children}
+  </button>
+);
+
+function DoneScreen({ onDone }) {
+  useEffect(() => {
+    const t = setTimeout(onDone, 3500);
+    return () => clearTimeout(t);
+  }, [onDone]);
+  return (
+    <div style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, textAlign: "center" }}>
+      <div style={{ width: 64, height: 64, borderRadius: "50%", background: GREEN, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 30 }}>✓</div>
+      <div style={{ fontWeight: 800, fontSize: 19 }}>Stock logged</div>
+      <div style={{ color: GREY, fontSize: 13.5 }}>The dashboard has been updated. You're good to go.</div>
+      <Btn variant="ghost" onClick={onDone}>Done</Btn>
+    </div>
+  );
+}
+
+function DeviceFrame({ kind, children }) {
+  const phone = kind === "phone";
+  return (
+    <div
+      style={{
+        width: phone ? 340 : 620,
+        height: phone ? 620 : 560,
+        maxWidth: "100%",
+        background: BG,
+        borderRadius: phone ? 34 : 22,
+        border: `10px solid ${INK}`,
+        overflow: "hidden",
+        display: "flex",
+        flexDirection: "column",
+        boxShadow: "0 18px 50px rgba(0,0,0,.18)",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
